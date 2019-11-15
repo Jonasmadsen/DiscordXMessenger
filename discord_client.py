@@ -1,7 +1,7 @@
 import asyncio
 import io
 import os
-import urllib.request
+from asyncio import coroutine
 
 import aiohttp
 import discord
@@ -10,8 +10,10 @@ from discord import Attachment
 from dotenv import load_dotenv
 from fbchat import ImageAttachment
 from rx import Observable
+
+from exceptions.unrecognized_attachment_exception import UnrecognizedAttachmentException
 from fb_client import FBClient, Message, ThreadType
-from message import Message as internalMessage
+from message import Message as InternalMessage
 
 load_dotenv()
 
@@ -22,45 +24,36 @@ class DiscordClient(discord.Client):
 
         self.fb_client = fb_client
         self.observable = observable
+        self.channel: discord.TextChannel = None
+        self.thread_type = ThreadType.USER if os.getenv("THREAD_TYPE") == "USER" else ThreadType.GROUP
+        self.thread_id = os.getenv("THREAD_ID")
 
     # Event called when Discord Bot is ready.
     async def on_ready(self):
+        self.channel = self.get_channel(int(os.getenv("CHANNEL_ID")))
+
         print("Discord Bot ready.")
         print("Logged in as")
         print(self.user.name)
         print(self.user.id)
+        print("Operating on channel")
+        print(f"Server name: {self.channel.guild}")
+        print(f"Channel name: {self.channel.name}")
         print("-------------------")
 
         # Subscribe to observable. on_next defines function to call when observable emits.
         self.observable.subscribe(on_next=lambda s: self.send_message(s))
 
-    # Event called when message is received through Discord.
-    async def on_message(self, message):
-        # Make sure message author is not self.
+    async def on_message(self, message: discord.Message):
         if message.author != self.user:
-            # Check if the message contains attachments.
             if message.attachments:
-                # Check if the message has multiple attachments.
-                if len(message.attachments) > 1:
-                    # If the message contains multiple attachments, raise an exception.
-                    raise Exception("More than one attachment received in a single message.")
-                else:
-                    # Otherwise we assume the attachment is an image and send it to FB. TODO Dont assume this.
-                    attachment: Attachment = message.attachments.pop()
-                    self.fb_client.sendRemoteImage(attachment.url, message=f"{message.author}:",
-                                                   thread_id=os.getenv("THREAD_ID"), thread_type=ThreadType.USER)
-            # If the message contains no attachments, just send it.
+                attachment: Attachment = message.attachments.pop()  # TODO Check attachment type somehow
+                self.fb_client.sendRemoteFiles(file_urls=attachment.url, message=f"{message.author}:", thread_id=self.thread_id, thread_type=self.thread_type)
             else:
-                # Create a message string from author name and message content.
-                message_str = f"{message.author}: {message.content}"
-                # Send message string in messenger using fb_client.send.
-                # Env var THREAD_ID must be id of thread to send to.
-                # ThreadType is USER for user to user chats, GROUP for group chats.
-                self.fb_client.send(Message(text=message_str), thread_id=os.getenv("THREAD_ID"),
-                                    thread_type=ThreadType.USER)
+                self.fb_client.send(Message(text=f"{message.author}: {message.content}"), thread_id=self.thread_id, thread_type=self.thread_type)
 
     # Coroutine called to send images to Discord channel.
-    async def send_image(self, message, attachment, channel):
+    async def send_image(self, message: InternalMessage, attachment: ImageAttachment):
         # Get image url.
         image_url = self.fb_client.fetchImageUrl(attachment.uid)
         # Attempt to download image.
@@ -71,28 +64,21 @@ class DiscordClient(discord.Client):
                     raise Exception("Unable to download picture.")
                 data = io.BytesIO(await resp.read())
                 # Send image.
-                await channel.send(file=discord.File(data, f"{attachment.uid}.jpg"))
+                await self.channel.send(content=f"{message.author}:", file=discord.File(data, f"{attachment.uid}.{attachment.original_extension}"))
 
-    # Synchronous function that adds channel.send to the event loop.
-    def send_message(self, message: internalMessage):
-        # Get channel from env var CHANNEL_ID
-        channel = self.get_channel(int(os.getenv("CHANNEL_ID")))
-
-        # Check if message contains attachments.
-        if message.attachments:
-            # Check that there is only 1 attachment.
-            if len(message.attachments) > 1:
-                raise Exception("More than one attachment received in a single message.")
-
-            attachment = message.attachments.pop()
-            # Check that the attachment is an Image
-            if isinstance(attachment, ImageAttachment):
-                # Run the coroutine for sending an image message.
-                asyncio.run_coroutine_threadsafe(self.send_image(message, attachment, channel), self.loop)
-
-            # If the attachment is not an image, raise an exception.
+    def send_message(self, message: InternalMessage):
+        try:
+            # Check if message contains attachments.
+            if message.attachments:
+                attachment_type_dict = {ImageAttachment: self.send_image}
+                for attachment in message.attachments:
+                    if type(attachment) in attachment_type_dict:
+                        attachment_func: coroutine = attachment_type_dict.get(type(attachment))
+                        asyncio.run_coroutine_threadsafe(attachment_func(message, attachment), self.loop)
+                    else:
+                        raise UnrecognizedAttachmentException(f"Message contained unrecognized attachment type. Message: \"{message.author}: {message.content}\". Attachment type: {type(attachment)}")
             else:
-                raise Exception("Attachment is not an image.")
-        # If message does not contain attachments, just send the contents.
-        else:
-            asyncio.run_coroutine_threadsafe(channel.send(message.content), self.loop)
+                asyncio.run_coroutine_threadsafe(self.channel.send(content=f"{message.author}: {message.content}"), self.loop)
+        except UnrecognizedAttachmentException as exception:
+            print(exception)
+            asyncio.run_coroutine_threadsafe(self.channel.send(content=exception), self.loop)
