@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from fbchat import Client
 from fbchat.models import *
 from rx.subject import Subject
-from message import Message as internalMessage
+from message import Message as InternalMessage
 
 load_dotenv()
 
@@ -44,4 +44,4 @@ class FBClient(Client):
 
             # Push message to observable.
 
-            self.subject.on_next(internalMessage(content=f"{message_object.text}", author=f"{user.name}", attachments=message_object.attachments))
+            self.subject.on_next(InternalMessage(content=f"{message_object.text}", author=f"{user.name}", attachments=message_object.attachments))
